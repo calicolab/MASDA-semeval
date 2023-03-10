@@ -165,7 +165,8 @@ class InteractionModel(torch.nn.Module):
         modalities: int = 4,
         mapper_depth: int = 2,
         dropout: float = 0.2,
-        pad_token_id: int = 0
+        pad_token_id: int = 0,
+        sentence_mode: bool = True
     ):
         """
         Args:
@@ -181,8 +182,13 @@ class InteractionModel(torch.nn.Module):
             Defaults to 2.
             pad_token_id (int, optional): Token Id assigned to the padding token.
             Defaults to 0.
+            sentence_mode (bool, optional): Indicates whether the conversation embedding
+            is a sentence embedding (N x hidden_dims) or token embedding
+            (N x seq_len x hidden_dims). Defaults to True.
         """
         super().__init__()
+
+        self.sentence_mode = sentence_mode
 
         # Low dimension linear transformation for the high dim conv embeddings
         self.linmap_block = self._get_linmap_block(
@@ -227,7 +233,8 @@ class InteractionModel(torch.nn.Module):
 
         # Add a singleton dimension at axis=1 to make the text_embeddings
         # compatible in shape to the ann_embeddings
-        text_embeddings = text_embeddings.unsqueeze(dim=1)
+        if self.sentence_mode:
+            text_embeddings = text_embeddings.unsqueeze(dim=1)
 
         # Get the annotator attention masks (as required by HF transformers)
         attention_mask = (ann_tokens!=self.pad_token_id).type(torch.long)
@@ -479,7 +486,7 @@ class AgreementModel_vanilla(pl.LightningModule):
         }
 
 
-class AgreementModel(pl.LightningModule):
+class AgreementModel_pooled(pl.LightningModule):
     def __init__(
         self,
         mpath: str,
@@ -555,6 +562,165 @@ class AgreementModel(pl.LightningModule):
 
         pooled_ann_embedding, _, _ = self.interaction_model(
             sent_embedding, ann_tokens
+        )
+
+        return self.task_head(pooled_ann_embedding)
+
+    def common_step(self, batch, batch_idx):
+        _, (text_tokens, ann_tokens), (_, soft_targets) = batch
+        soft_labels = self(text_tokens, ann_tokens)
+
+        __soft = self.soft_label_loss(
+            soft_labels.log_softmax(dim=1),
+            soft_targets
+        )
+
+        return {
+            'loss': __soft,
+            'soft_loss': __soft
+        }
+
+    def training_step(self, batch, batch_idx, *args, **kwargs):
+        loss_dict = self.common_step(batch, batch_idx)
+        # logs metrics for each training_step,
+        # and the average across the epoch
+        for k,v in loss_dict.items():
+            self.log("train_" + k, v.item(), prog_bar=True)
+
+        return loss_dict
+
+    def validation_step(self, batch, batch_idx, *args, **kwargs):
+        loss_dict = self.common_step(batch, batch_idx)
+        # logs metrics for each training_step,
+        # and the average across the epoch
+        for k,v in loss_dict.items():
+            self.log("val_" + k, v.item(), prog_bar=True)
+
+        return loss_dict
+
+    def test_step(self, batch, batch_idx, *args, **kwargs):
+        hard_metric = BinaryF1Score().to(self.device)
+        _, (text_tokens, ann_tokens), (_, soft_targets) = batch
+        soft_labels = self(text_tokens, ann_tokens)
+        hard_labels = soft_labels.argmax(dim=1).reshape(soft_labels.shape[0], 1)
+        hard_targets = soft_targets.argmax(dim=1).reshape(soft_labels.shape[0], 1)
+
+        # Do not consider the samples with 50-50 split as the class was
+        # randomly chosen
+        keep_indices = torch.nonzero(soft_targets[:, 0] != soft_targets[:, 1])
+        hard_labels = hard_labels[keep_indices]
+        hard_targets = hard_targets[keep_indices]
+
+        self.log_dict({
+            'soft_score': F.cross_entropy(soft_labels, soft_targets),
+            'hard_score': hard_metric(
+                hard_labels,
+                hard_targets
+            )
+        })      
+
+    def predict_step(self, batch, batch_idx):
+        ids, (text_tokens, ann_tokens) = batch
+
+        with torch.no_grad():
+            soft_labels = self(text_tokens, ann_tokens)
+            soft_labels = soft_labels.softmax(dim=1)
+
+        return (
+            ids,
+            soft_labels.argmax(dim=1).reshape(soft_labels.shape[0], 1),
+            soft_labels
+        )
+
+    def configure_optimizers(self):
+        param_dicts = [
+              {"params": self.task_head.parameters()},
+              {"params": self.interaction_model.parameters()},
+              {
+                  "params": self.backbone.parameters(),
+                  "lr": self.backbone_lr,
+              },
+        ]
+
+        optimizer = torch.optim.AdamW(
+            param_dicts,
+            lr=self.task_head_lr,
+            weight_decay=self.weight_decay
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    patience=4),
+                "monitor": "val_soft_loss"
+            },
+        }
+
+class AgreementModel(pl.LightningModule):
+    def __init__(
+        self,
+        mpath: str,
+        interaction_model: InteractionModel,
+        backbone_lr: float = 2e-5,
+        task_head_lr: float = 2e-4,
+        weight_decay: float = 1e-4
+    ):
+        """
+        Args:
+            mpath (str): Path to the `transformer` artifact files.
+            interaction_model (InteractionModel): The model to account for
+            annotator differences.
+            backbone_lr (float, optional): The LLM's learning rate.
+            Defaults to 2e-5.
+            task_head_lr (float, optional): Task head/s' learning rate.
+            Defaults to 2e-4.
+            weight_decay (float, optional): Common weight decay co-efficient.
+            Defaults to 1e-4.
+        """
+        super().__init__()
+        self.backbone_lr = backbone_lr
+        self.task_head_lr = task_head_lr
+        self.weight_decay = weight_decay
+
+        # Base model        
+        self.backbone = AutoModel.from_pretrained(mpath)
+        # Pooling layer to get the sentence embedding
+        self.pooling = Pooling(
+            self.backbone.config.hidden_size,
+            pooling_mode='mean'
+        )
+        # Freeze the backbone model
+        if not backbone_lr:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        # Annotator interaction Model
+        self.interaction_model = interaction_model
+
+        # Soft label predictor
+        self.task_head = torch.nn.Linear(
+            self.interaction_model.ann_dim,
+            2
+        )
+
+        self.soft_label_loss = torch.nn.KLDivLoss(
+            reduction="batchmean"
+        )
+
+        # Save the init arguments
+        self.save_hyperparameters(ignore=['interaction_model'])
+
+    def forward(self, text_tokens, ann_tokens):
+        # Push all inputs to the device in use
+        ann_tokens.to(self.device)
+        text_tokens = {k: v.to(self.device) for k, v in text_tokens.items()}
+
+        token_embeddings = self.backbone(**text_tokens)[0]
+
+        pooled_ann_embedding, _, _ = self.interaction_model(
+            token_embeddings, ann_tokens
         )
 
         return self.task_head(pooled_ann_embedding)
